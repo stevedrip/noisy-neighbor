@@ -7,10 +7,6 @@ import scodec.bits.BitVector
   * Two keys conflict when one is a prefix of the other, or they are equal. Length is part of a key's identity: "0" and
   * "00" are different keys.
   *
-  * A key has no algebraic structure of its own. The meet of two keys (their longest common prefix) is a semilattice
-  * with a bottom, but nothing here needs it, and the structure that does matter, union, intersection and difference
-  * of sets of keyed entries, lives on [[Trie]].
-  *
   * This is an opaque type, so a `Key` is a `BitVector` at runtime with no wrapper object. The type keeps keys apart
   * from other bit vectors.
   */

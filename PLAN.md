@@ -2,79 +2,70 @@
 
 ## Decided
 
-- **Architecture.** One scheduler holds the trie and barrier logic. Stateless, idempotent workers run the handler. See README.
-- **Backpressure.** The scheduler has a bounded buffer (waiting + in-flight). Reading pauses when it is full and resumes as messages finish. Pausing is per shard where the reader allows it.
-- **Quarantine is not a separate feature.** It falls out of splitting shards: once a noisy subtree has its own shard, pausing that shard's reads stalls nothing else. One bounded buffer, no parking, no per-subtree buffers.
-- **Dead-lettered counts as finished** (from README). Revisit: one poison message releases its whole subtree.
+- **Model.** A trie of FIFO queues. A queue owns a key prefix, and reading from it does not remove anything until the reader acknowledges: messages are added at the back, a reader reads from the front without removing them, and acknowledging removes them. Nothing else can look inside it (no search, index or count). See README ("How queues enforce it").
+- **Producers enqueue only at the root queue.** One total arrival order. A queue forwards messages to the child whose prefix the key starts with, in order, when it reads them (acknowledging each in the parent).
+- **One message at a time per queue.** A queue's own messages (key equals its prefix, or no child owns it) wait for earlier messages in the conflicting children and hold back the queue behind them. Parallelism comes from having several queues (and several workers).
+- **Split.** The child is created at once, empty. It receives messages only as the parent reads and forwards them. The parent's existing backlog is not redistributed.
+- **Merge = drain.** The child stops accepting new messages. The parent keeps the range's messages as its own, each waiting for the draining child to be empty (all of it; the parent cannot see inside). A draining queue's children drain with it. The child is removed when empty.
+- **Kinesis is the source, not the queue.** Queues are in memory. Mapping queues to shards (or chains of shards) was explored and does not fit; reasons are in README ("Kinesis"). Checkpoint = oldest unfinished root message (`resumeFrom`).
+- **Backpressure.** Pausing reads is the policy. Capacity (bound on unfinished messages) is configuration of the consumer, not a property of the trie. Pausing happens at the root, in the shell.
+- **No failure handling.** Retries, attempt limits, poison messages and dead-lettering are the consumer's decision, not ours. A batch that was handed out and not acknowledged stays at the front of its queue, holding back what is behind it, and when the consumer asks again for a batch it gets it back. The consumer acknowledges once it is done with the messages, whatever it did with them.
 - **Ordering unit is the message, never the batch.**
-
-- **Language.** Scala on the Typelevel stack (cats-effect).
+- **Pull model, one consumer per queue.** The consumer asks its queue for a batch of up to X messages and may get fewer, or none (`takeFrom(queue, X)`). Only a queue's own consumer moves its front: its ask forwards what is ahead of its first own message into the children, then hands out a batch of its own messages. A child sees a message only after its parent's consumer has asked, so every consumer keeps asking. A batch starts at the first message not acknowledged, so asking again gives back what is not acknowledged and may extend it; a consumer that asks again has stopped working on what it had, which is also when a message that a split gave to a child is forwarded. Consumers acknowledge by absolute offset, cumulatively and idempotently (`acknowledge(queue, through)`), as many messages as they like, and the tree trusts the offsets it is given. `take(X)` asks the queues in turn and returns the first batch; `advance(X)` asks each once, parents first. Replacing a consumer is done only once the old one is gone.
+- **A batch comes from one queue.** The consumer asks for up to X messages and may get fewer. One batch at a time per queue. The handler applies a batch in arrival order, and a batch is acknowledged as a whole. Acks are by offset (`resumeFrom`).
+- **Removed.** The conflict-index design (radix `Trie`, `AntichainTrie`, `GenBool`/gcd, `Bits`, typelevel `algebra`) is deleted. It tracked every unfinished message in a searchable set; the queue tree makes order structural, so none of it is needed. It is in the git history (the wip commits). Remove the `algebra`, `algebra-laws` and `discipline-munit` dependencies from `build.sbt` if nothing uses them after the rewrite.
 
 ### Design shape
 
-- Pure core: `step(state, event) => (state, commands)`. Events: `Arrived`, `Completed`, `Failed`. Commands: `Dispatch`, `DeadLetter`, `PauseReads`, `ResumeReads`. No effects, so property tests need no IO or clock.
-- Thin cats-effect shell around the core: reader fiber, dispatch, completion channel, bounded buffer.
-- Admission: keep every unfinished message (waiting and in-flight) in the trie with its arrival sequence number. A message is admissible iff no other earlier unfinished message is on its path or in its subtree. Waiting messages block later conflicting ones, which gives the no-overtaking rule for free.
+- Pure core, effects outside: `step(state, event) => (state, commands)`. Events: `Arrived`, `Completed`, plus split and merge. Commands: `Dispatch`, `PauseReads`, `ResumeReads`.
+- `QueueTrie[A]`: `queue` (opaque FIFO), `children: TreeMap[BitVector, QueueTrie[A]]`, `drain: Boolean`.
+- Keep the router (which queue a message belongs to) separate from the queue itself.
+- Thin cats-effect shell around the core: reader fiber, dispatch to workers, ack channel, pause signal.
 
 ## Open decisions
 
-1. Failure policy: retry count, backoff. Default: 3 retries.
-2. Message id carried for dedupe on redispatch (at-least-once).
-3. Worker contract: one message or a batch per dispatch, ack shape, redispatch timeout. Default: the scheduler batches only already-admitted messages, and acks carry message ids.
-4. Fairness among admitted messages when workers are scarce. Default: arrival order.
+1. Command and event shapes for split and merge (who issues them, how they are sequenced against arrivals).
+2. Exactly when a queue's own message counts as started versus read, and what "in flight" means for acks.
+3. Whether a queue's own message waits only on conflicting children (current README rule) or on all children. Merge waits on the whole draining child regardless.
+4. Redispatch: when a consumer asks again is its own business (no timeout in the tree). Fencing a replaced consumer is outside it.
+5. Fairness among queues when workers are scarce. Default: arrival order.
 
 ## Status
 
-Prototype 1 is built: `Trie`, `Scheduler.step`, and a virtual-clock `Simulator` (test sources).
+`QueueTrie` is built (`Fifo.scala`, `QueueTrie.scala`, `FifoSuite.scala`, `QueueTrieSuite.scala`) and the project compiles with 40 tests passing. A node is a `Fifo` (add, read from the front without removing, acknowledge by offset), its children, and a `draining` flag. There is no per-queue state about what was handed out. The tree is a pure value: `enqueue` (root only), `split`, `drain`, `acknowledge`, `takeFrom`, `take`, `advance`. Choices in it, to revisit:
+- A queue's own message waits only for children whose prefix is related to its key (a prefix of it, or extended by it). It waits for that child's whole subtree, since it cannot see inside. A draining child counts whatever is in it.
+- A batch is a run of own messages with no forward between them, because a forward starts running in the child at once and would overtake. The first message that is a forward, is blocked, or would exceed `maxBatch` ends the batch, and stays at the front of the queue where it is looked at again next time.
+- Offsets are absolute per queue (`Fifo.start` is the offset of the front). A re-ask is recomputed from the front, so what is out comes back because it is still startable. That holds because forwarding at a queue happens only on its own consumer's ask, and children only gain messages from that forwarding. The tree has no notion of failure, no attempt count and no retry.
+- `drain(prefix)` (merge is draining a child) marks only that queue as draining, and the root can be drained: `enqueue` then fails and the root stays when empty. Its descendants keep receiving what it forwards, so they drain with it without a flag of their own.
+- Operations are total: there are no error results. `split` makes sure an accepting queue exists for a prefix: it creates one (adopting the children that extend the prefix) or leaves the existing one, so it is idempotent, and it stops any draining queue on the way down from the root, the target included, from draining, since messages for the prefix reach its queue only through them. `drain`, `acknowledge` and `takeFrom` on a queue that is not there change nothing (acknowledging a removed queue is safe because it was removed only when empty), and asking for zero messages hands out none. The one refusal a producer must hear about is `enqueue` on a draining root, which returns no tree (`Option`).
+- Tree walks recurse once per level, so depth is the number of nested splits.
 
-Lattices (typelevel `algebra`):
-- The algebra lives on `Trie[A]`, not on `Key`. A trie is a finite set of entries `(key, value)`, and `GenBool[Trie[A]]` is union (`or`), intersection (`and`) and difference (`without`), with the empty trie as `zero`. It has one bound: there is no set of all entries, so no `one` (as with `Set[A]` over an unbounded `A`). Adding or removing a message is union or difference with a singleton; tests check `insert`/`remove` against those, and `or`/`and`/`without` against plain set operations on `entries`. Laws: `LogicLaws.generalizedBool` from `algebra-laws` + `discipline-munit`.
-- Representation: `Trie` is `Empty | Node(own, zero, one, min)`. `Empty` is the `zero`, and is its own children, so the three operations are direct pointwise recursions whose base cases are the laws of `zero` (`x|0=x`, `x&0=0`, `x-0=x`, `0-x=0`). The single smart constructor `Trie.node` collapses an all-empty node to `Empty`, so there is one representation and no per-operation pruning. An earlier version used `Option[Trie]` children, which encoded the zero two ways (`None` and `Some(empty)`) and needed a `pruned` step after each recursion. There is no `isEmpty`: a trie is empty exactly when its summary `min` is the summary lattice's top (`L.isOne(summary)`, checked once in `node`), and callers ask `GenBool.isZero`. `Empty` is one shared instance, so `x | 0`, `0 | x` and `x - 0` return `x` itself. The checks are ours, not the library's: `algebra` never calls `isZero`/`isOne` for you (they are plain `eqv(a, zero)` queries, and `or`/`and`/`without` are abstract). The both-zero guard is needed for termination (`Empty` is its own children); the one-sided shortcuts are an optimization that makes `insert` (union with a singleton) O(depth) by sharing untouched subtrees, and `TrieSuite` pins them with reference equality.
-- `Key` is an opaque type over `scodec.bits.BitVector` (no wrapper object at runtime) with no instances: only `isPrefixOf`, `conflictsWith` (equal, or one a prefix of the other), `show` and `parse`. We tried giving it structure and dropped it. The longest common prefix is a meet and the root is its bottom, but nothing needs it, and `BoundedMeetSemilattice` cannot apply: its `one` is the identity of meet (a key extending every key), while the root is the opposite, the absorbing element. An `Option[Key]` lattice would adjoin an artificial second bound. If the longest common prefix is needed later (e.g. a shard's covering prefix for Kinesis), add it as a plain function.
-- Each trie node summarizes its subtree with `BoundedMeetSemilattice[Option[A]]` (min, `None` as top), checked with `LatticeLaws.boundedMeetSemilattice`. `minConflicting` is the meet over the entries on a prefix of the query key and at or below it; it is a homomorphism from union to that meet (tested).
-- Removal needs the per-node sets because a semilattice has no inverse. A node with many same-key waiting messages stays cheap only because the values form a chain.
+Tests: unit tests for the README scenarios, and a property test that does random enqueues, splits, drains, asks (of one queue or any), acknowledgments (partial, full, stale and beyond what was handed out), then checks from the recorded deliveries and acknowledgments alone that every conflicting pair ran in order (the earlier message ended before the later one started, or they share a batch in order), that every message finished, and that nothing is left waiting when nothing is running. Mutation checks done, each makes a test fail: own messages never blocked, a forward in the middle of a batch, a running queue still taking messages, the draining relation, pruning a draining queue early, a split that does not adopt.
 
-The cats-effect shell is built too: `Runner.run(settings, source, handler, deadLetter)`. One loop fiber owns the scheduler state; a reader fiber pulls from an fs2 `Stream[IO, Message]` and hands messages over one at a time (checking the pause signal before each pull); `workers` fibers run the handler and ack. Tests run it on `TestControl`'s virtual clock against the same oracle (`Checks`) as the simulator. 37 tests pass. Not built: Kinesis, remote workers.
+Parked, to be rebuilt on `QueueTrie`: `Scheduler`, `Runner`, `Simulator`, `Harness`, `Checks` and their suites (`SchedulerSuite`, `SimulationSuite`, `RunnerSuite`). They are in git history, and were removed from the working tree so the project compiles. `Runner`'s structure still applies: one loop fiber owning state, a reader with pause gating and a per-arrival handshake, worker fibers acking. `Key` and `Scheduling` (`Message`, `Event`, `Command`, to be revised) are kept.
 
 Shell choices, to revisit:
-- Handler errors and handler timeouts both count as a failed attempt. A `deadLetter` or source failure fails the whole run.
-- Retry backoff sleeps inside the worker, so it occupies a worker slot.
+- A handler error or timeout is the consumer's concern. A source failure fails the whole run.
 - The reader waits for the loop to process each arrival before checking the pause flag, so the buffer bound is strict. This costs one handoff per message.
 - Source chunking (batch size) is invisible to scheduling; a test checks it.
 - `IO` is used directly, not `F[_]`.
+- `Arrived` events must come in increasing `seq`. Arrivals at or below the highest seq seen are ignored, which makes replay after restart harmless. Acks for messages not in flight are ignored.
 
-Choices made in the core, to revisit:
-- `Config.maxAttempts` is the total number of runs, not retries after the first.
-- Retry backoff and ack timeouts are shell concerns, not in the core.
-- `Arrived` events must come in increasing `seq`. Arrivals at or below the highest seq seen are ignored, which makes replay after restart harmless. Cross-shard arrival is deferred.
-- Each `step` rescans all waiting messages for admissibility: O(waiting x key depth). Fine for a prototype; revisit if the waiting set gets large.
-- `Dispatch` carries every message admitted by one event; they are pairwise non-conflicting.
+## Tests
 
-## Prototype 1: scheduler library
-
-Pure library, driven by an in-memory simulated stream, with a virtual clock (a message with value n takes n simulated seconds). No Kinesis, no real workers.
-
-- Trie of unfinished messages keyed by bitstring.
-- Admit a message once no earlier conflicting message is unfinished. A waiting barrier holds back later conflicting messages (no overtaking).
-- Bounded buffer: stop reading when full.
-- Dispatch, completion, retry, dead-letter (counts as finished).
-- Per-shard low-watermark for checkpointing, even though the prototype has a single stream.
-
-### Tests
-
-Property test with random keys, durations and arrival orders. From the output trace, assert:
+Property tests with random keys, durations and arrival orders, with an independent oracle over the output trace:
 - Every conflicting pair ran in arrival order and did not overlap.
 - Non-conflicting pairs overlapped when workers were available.
 - No message started while an earlier conflicting message was unfinished.
-- Barrier starvation case: `c` behind a waiting `a` (README's worked example).
-- Bounded buffer never exceeded, and the scheduler never deadlocks on a single stream.
+- A message waiting for earlier conflicting ones holds back later conflicting ones, even ones that conflict with nothing in flight (README's worked example).
+- Splits and merges at random points do not change any of the above. After a merge, the child's messages all finish before the parent's own messages for that range start.
+- Bounded buffer never exceeded; no deadlock.
+- Mutation checks: break the code, confirm a failure, restore.
 
 ## Deferred
 
-- **Scope the trie in an `Order` module (decided, not yet done).** Make the trie type a member of `class TrieOf[A](using Order[A])`, so path-dependent types (`SeqTrie.Trie`, with `object SeqTrie extends TrieOf[Long]`) make mixing tries built from different orders a compile error. Today a single `using Order[A]` is threaded through every operation and also embedded in each node's `SortedSet`, and nothing enforces that the instance passed at a call matches the one a trie was built with; we rely on `Order[A]` being canonical. Cost: a module value per element type, imports at use sites, and `Scheduler.State` referencing the module. Also consider renaming the `zero`/`one` child fields (they collide with the algebra names).
-- **Multiple shards.** Cross-shard order via fence records written to every shard under a barrier's subtree. Never read past an unexecuted barrier's fence on any shard. That keeps the buffer closed under predecessors, which avoids a buffer-space deadlock (the order itself is acyclic; the cycle comes from the shared buffer).
-- Parent-before-child ordering for split shards. Whether the scheduler reads a child before its parent is drained, using the trie's conflict rules instead of strict lineage order.
-- Resharding workflow: two sequential splits per tenant, poll until `ACTIVE`, retry on `ResourceInUseException`. Verify limits against current docs.
-- Key encoding in Kinesis (`ExplicitHashKey`, left-aligned into the 128-bit space).
+- Kinesis source for the root queue (reading, checkpointing by `resumeFrom`, backoff on throttling).
+- Key encoding if a hash key is ever needed (`ExplicitHashKey`, left-aligned in the 128-bit space). Only relevant if shards are revisited.
 - Scheduler failover and leader election. Replay from checkpoint on takeover.
-- Automatic splitting.
+- Automatic splitting and merging.
+- Remote workers.

@@ -14,15 +14,15 @@ object MessageId:
   */
 final case class Message(id: MessageId, seq: Long, key: Key, value: Int)
 
-/** Inputs to the scheduler's pure core. */
+/** Inputs to the scheduler's pure core. An ack names the whole message, because
+  * its key is how the scheduler finds it.
+  */
 enum Event:
   case Arrived(message: Message)
-  case Completed(id: MessageId)
-  case Failed(id: MessageId)
+  case Completed(message: Message)
 
 /** Outputs of the scheduler's pure core, interpreted by the effectful shell. */
 enum Command:
   case Dispatch(messages: List[Message])
-  case DeadLetter(message: Message)
   case PauseReads
   case ResumeReads

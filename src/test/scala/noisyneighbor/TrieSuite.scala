@@ -1,89 +1,166 @@
 package noisyneighbor
 
-import algebra.laws.{LatticeLaws, LogicLaws}
-import algebra.lattice.{BoundedMeetSemilattice, GenBool}
+import algebra.lattice.GenBool
+import algebra.laws.LogicLaws
 import cats.kernel.Eq
 import munit.DisciplineSuite
 import org.scalacheck.{Arbitrary, Gen}
 import org.scalacheck.Prop.forAll
+import scodec.bits.BitVector
 
-import Fixtures.{genEntries, genKey, genTrie, trieOf}
-import Trie.given
+import Fixtures.{genKey, key}
 
 class TrieSuite extends DisciplineSuite:
-  private def indexed(keys: List[Key]): List[(Key, Long)] =
-    keys.zipWithIndex.map((k, i) => (k, i.toLong))
+  override def scalaCheckTestParameters =
+    super.scalaCheckTestParameters.withMinSuccessfulTests(200)
 
-  // --- conflict queries ---
+  /** Every key of up to four bits: the keys the generators draw from. */
+  val universe: List[Key] =
+    (0 to 4).toList.flatMap: n =>
+      (0 until (1 << n)).toList.map: i =>
+        Key(BitVector.fromLong(i.toLong, n))
 
-  property("minConflicting matches a brute-force scan"):
-    forAll(Gen.listOf(genKey), genKey): (keys, query) =>
-      val entries = indexed(keys)
-      val expected = entries.collect { case (k, s) if k.conflictsWith(query) => s }.minOption
-      trieOf(entries).minConflicting(query.bits) == expected
+  /** Sets of integers, to have a value type richer than `Boolean`. */
+  given setGenBool: GenBool[Set[Int]] = new GenBool[Set[Int]]:
+    def zero: Set[Int] = Set.empty
+    def or(a: Set[Int], b: Set[Int]): Set[Int] = a | b
+    def and(a: Set[Int], b: Set[Int]): Set[Int] = a & b
+    def without(a: Set[Int], b: Set[Int]): Set[Int] = a -- b
 
-  property("minConflicting still matches after removals"):
-    forAll(Gen.listOf(genKey), genKey): (keys, query) =>
-      val entries = indexed(keys)
-      val (removed, kept) = entries.partition(_._2 % 2 == 0)
-      val trie = removed.foldLeft(trieOf(entries))((t, e) => t.remove(e._1.bits, e._2))
-      val expected = kept.collect { case (k, s) if k.conflictsWith(query) => s }.minOption
-      trie.minConflicting(query.bits) == expected
+  val genBoolValue: Gen[Boolean] = Gen.oneOf(true, false)
+  val genSetValue: Gen[Set[Int]] = Gen.listOf(Gen.choose(0, 3)).map(_.toSet)
 
-  property("the root's summary is the meet of everything stored"):
-    forAll(Gen.listOf(genKey)): keys =>
-      val entries = indexed(keys)
-      trieOf(entries).min == entries.map(_._2).minOption
+  /** No node that could be left out or merged into its edge, no empty or
+    * overlapping labels, anywhere: the one form of a trie.
+    */
+  def normalized[A](trie: Trie[A])(using ev: GenBool[A], eq: Eq[A]): Boolean =
+    val labels = trie.children.keys.toList
+    labels.forall(!_.isEmpty) &&
+    labels.zip(labels.drop(1)).forall((a, b) => !b.startsWith(a)) &&
+    trie.children.values.forall(child =>
+      !ev.isZero(child.value) && normalized(child)
+    )
 
-  property("removing everything leaves an empty trie"):
-    forAll(Gen.listOf(genKey)): keys =>
-      val entries = indexed(keys)
-      sets.isZero(entries.foldLeft(trieOf(entries))((t, e) => t.remove(e._1.bits, e._2)))
+  /** The same checks for each value type. */
+  def checks[A](name: String, genValue: Gen[A])(using
+    ev: GenBool[A],
+    eq: Eq[A]
+  ): Unit =
+    type T = Trie[A]
+    val trieBool = summon[GenBool[T]]
 
-  test("same-key entries are kept in order"):
-    val k = Fixtures.key("01")
-    val trie = trieOf(List((k, 3L), (k, 1L), (k, 2L)))
-    assertEquals(trie.minConflicting(k.bits), Some(1L))
-    assertEquals(trie.remove(k.bits, 1L).minConflicting(k.bits), Some(2L))
+    val genEntries: Gen[List[(Key, A)]] =
+      Gen.choose(0, 10).flatMap(Gen.listOfN(_, Gen.zip(genKey, genValue)))
 
-  // --- the summary lattice: Option[Long] under min, with None as the top ---
+    /** Built with the trie's own union. */
+    def build(entries: List[(Key, A)]): T =
+      entries.foldLeft(Trie.empty[A])((t, e) =>
+        trieBool.or(t, Trie.single(e._1, e._2))
+      )
 
-  checkAll("Option[Long] min meet", LatticeLaws[Option[Long]].boundedMeetSemilattice)
+    /** The oracle: the map from key to value, a key given twice `or`ed. */
+    def model(entries: List[(Key, A)]): Map[String, A] =
+      entries.foldLeft(Map.empty[String, A]): (m, e) =>
+        m.updated(e._1.show, ev.or(m.getOrElse(e._1.show, ev.zero), e._2))
 
-  // --- the trie as a generalized Boolean algebra of entry sets ---
+    given Arbitrary[T] = Arbitrary(genEntries.map(build))
 
-  private given Arbitrary[Trie[Long]] = Arbitrary(genTrie)
-  private given Eq[Trie[Long]] = Eq.fromUniversalEquals
+    checkAll(s"Trie[$name]", LogicLaws[T].generalizedBool)
 
-  private val sets = summon[GenBool[Trie[Long]]]
-  private val summary = summon[BoundedMeetSemilattice[Option[Long]]]
+    property(s"$name: get agrees with the map the entries make"):
+      forAll(genEntries): entries =>
+        val (trie, expected) = (build(entries), model(entries))
+        universe.forall(k =>
+          eq.eqv(trie.get(k), expected.getOrElse(k.show, ev.zero))
+        )
 
-  checkAll("Trie entry sets", LogicLaws[Trie[Long]].generalizedBool(sets))
+    property(s"$name: entries are the keys with a value, once each"):
+      forAll(genEntries): entries =>
+        val listed = build(entries).entries.map((k, v) => (k.show, v))
+        val expected = model(entries).filterNot((_, v) => ev.isZero(v))
+        listed.toMap == expected && listed.size == expected.size
 
-  property("a trie holds exactly the entries inserted into it"):
-    forAll(genEntries)(es => trieOf(es).entries.toSet == es.toSet)
+    property(s"$name: union, intersection and difference are pointwise"):
+      forAll(genEntries, genEntries): (xs, ys) =>
+        val (a, b) = (build(xs), build(ys))
+        universe.forall: k =>
+          eq.eqv(trieBool.or(a, b).get(k), ev.or(a.get(k), b.get(k))) &&
+            eq.eqv(trieBool.and(a, b).get(k), ev.and(a.get(k), b.get(k))) &&
+            eq.eqv(
+              trieBool.without(a, b).get(k),
+              ev.without(a.get(k), b.get(k))
+            )
 
-  property("or, and and without are union, intersection and difference of the entries, and stay canonical"):
-    forAll(genEntries, genEntries): (xs, ys) =>
-      val (x, y) = (trieOf(xs), trieOf(ys))
-      val (sx, sy) = (xs.toSet, ys.toSet)
-      sets.or(x, y) == trieOf((sx ++ sy).toList) &&
-        sets.and(x, y) == trieOf((sx & sy).toList) &&
-        sets.without(x, y) == trieOf((sx -- sy).toList)
+    property(s"$name: equal maps are equal tries, whatever the order"):
+      forAll(genEntries): entries =>
+        build(entries) == build(entries.reverse) &&
+          build(entries) == build(entries ++ entries)
 
-  property("insert is union with a singleton, and remove is difference with one"):
-    forAll(genTrie, genKey, Gen.choose(0L, 3L)): (t, k, a) =>
-      val single = Trie.singleton(k.bits, a)
-      t.insert(k.bits, a) == sets.or(t, single) && t.remove(k.bits, a) == sets.without(t, single)
+    property(s"$name: every trie that is built has the one form"):
+      forAll(genEntries, genEntries): (xs, ys) =>
+        val (a, b) = (build(xs), build(ys))
+        List(
+          a,
+          trieBool.or(a, b),
+          trieBool.and(a, b),
+          trieBool.without(a, b),
+          trieBool.without(a, a)
+        ).forall(normalized) &&
+        trieBool.without(a, a) == Trie.empty[A] &&
+        trieBool.and(a, Trie.empty[A]) == Trie.empty[A]
 
-  property("zero is the empty trie"):
-    forAll(genTrie)(t => sets.isZero(t) == t.entries.isEmpty && (t.min == None) == sets.isZero(t))
+  checks("Boolean", genBoolValue)(using
+    algebra.instances.boolean.booleanAlgebra,
+    summon[Eq[Boolean]]
+  )
+  checks("Set[Int]", genSetValue)
 
-  property("zero is skipped, not walked: x | 0, 0 | x and x - 0 return x itself, sharing it"):
-    forAll(genTrie): t =>
-      (sets.or(t, sets.zero) eq t) && (sets.or(sets.zero, t) eq t) && (sets.without(t, sets.zero) eq t)
+  given GenBool[Boolean] = algebra.instances.boolean.booleanAlgebra
 
-  property("conflict queries distribute over union: minConflicting is a homomorphism into the min meet"):
-    forAll(genTrie, genTrie, genKey): (x, y, q) =>
-      sets.or(x, y).minConflicting(q.bits) ==
-        summary.meet(x.minConflicting(q.bits), y.minConflicting(q.bits))
+  def or[A: GenBool: Eq](a: Trie[A], b: Trie[A]): Trie[A] =
+    summon[GenBool[Trie[A]]].or(a, b)
+
+  def without[A: GenBool: Eq](a: Trie[A], b: Trie[A]): Trie[A] =
+    summon[GenBool[Trie[A]]].without(a, b)
+
+  test("a key is one edge however long it is: nodes are keys and divergences"):
+    val long = Key(BitVector.fill(10000)(true))
+    val trie = Trie.single(long, true)
+    assertEquals(trie.children.size, 1)
+    assertEquals(trie.children.head._1.size, 10000L)
+    assert(trie.get(long))
+    assert(!trie.get(Key(BitVector.fill(9999)(true))))
+
+  test(
+    "keys that diverge are siblings, and a key between them is their parent"
+  ):
+    val a = Trie.single(key("0110"), true)
+    val b = Trie.single(key("0111"), true)
+    val both = or(a, b)
+    // There is no node where they merely diverge.
+    assertEquals(both.children.keys.map(_.toBin).toList, List("0110", "0111"))
+    // With a key at the point where they diverge, they hang from it, with labels
+    // relative to it.
+    val parent = or(both, Trie.single(key("011"), true))
+    assertEquals(parent.children.keys.map(_.toBin).toList, List("011"))
+    assertEquals(
+      parent.children.head._2.children.keys.map(_.toBin).toList,
+      List("0", "1")
+    )
+    assertEquals(parent.entries.map(_._1.show), List("011", "0110", "0111"))
+
+  test("a key and the keys that extend it, and the empty key at the root"):
+    val trie = List("", "0", "01", "011")
+      .map(k => Trie.single(key(k), true))
+      .reduce(or(_, _))
+    assertEquals(trie.entries.map(_._1.show), List("", "0", "01", "011"))
+    assert(trie.value)
+    assertEquals(trie.children.keys.map(_.toBin).toList, List("0"))
+
+  test("deep nesting: a chain of keys, each extending the last"):
+    val keys = (1 to 400).map(n => Key(BitVector.fill(n.toLong)(false)))
+    val chain = keys.map(k => Trie.single(k, true)).reduce(or(_, _))
+    assertEquals(chain.entries.size, 400)
+    val removed = without(chain, Trie.single(keys(199), true))
+    assertEquals(removed.entries.size, 399)
+    assert(!removed.get(keys(199)) && removed.get(keys(200)))

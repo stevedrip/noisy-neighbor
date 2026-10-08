@@ -1,155 +1,159 @@
 package noisyneighbor
 
-import algebra.lattice.{BoundedMeetSemilattice, GenBool}
-import cats.kernel.{Eq, Order}
+import algebra.lattice.GenBool
+import cats.kernel.Eq
+import scala.annotation.tailrec
+import scala.collection.immutable.TreeMap
 import scodec.bits.BitVector
 
-import scala.collection.immutable.SortedSet
-
-/** A finite set of entries `(key, value)`, indexed by key so that conflicting entries can be found quickly.
+/** A finite map from keys to `A`, where a key that is not in it has the zero of
+  * `A`. There is a node for every key with a value other than zero, and the
+  * root, which is the empty key and may hold zero. The parent of a node is the
+  * node of the longest key that is a proper prefix of its own, and the edge
+  * between them carries the bits in between, so the labels of the children of a
+  * node are relative to it. No label is a prefix of another (the children are
+  * an antichain), and none is empty. There are no nodes where keys merely
+  * diverge, so there are as many nodes as keys.
   *
-  * As an algebra, a trie is a generalized Boolean algebra (`GenBool`, see [[Trie.genBool]]): union, intersection and
-  * difference of entry sets, with the empty trie as `zero`. There is no `one`, since there is no set of all entries,
-  * just as `Set[A]` has none for an unbounded `A`. Adding and removing a message is union and difference with a
-  * singleton.
+  * A trie has one form, so `==` is equality of the maps: the shape follows from
+  * the keys that have a value and nothing else. No node other than the root
+  * holds zero.
   *
-  * The structure is a product of `GenBool`s: a node pairs the values stored at exactly its key (`own`) with a trie
-  * for each next bit, and the three operations act pointwise. The empty trie is the bound that ends every branch, and
-  * it is its own children, so each operation's base cases are just the laws of `zero`. A node whose parts are all
-  * empty is never built: the one smart constructor, `Trie.node`, returns the empty trie instead, so a trie has one
-  * representation and equal entries mean equal tries.
-  *
-  * The values are ordered (for the scheduler, arrival sequence numbers). Each node summarizes its subtree with the
-  * meet of a bounded meet-semilattice, so the summary is the smallest value, and `None` is the top: the summary of
-  * nothing. A node's `own` set holds the values stored at exactly its key and does not include its children's values;
-  * `min` is the meet over the whole subtree, cached so that a path is rebuilt in O(depth). The summary is a fold of
-  * the entry set, not part of its identity.
-  *
-  * A message conflicts with the entries on a prefix of its key (itself included) and with everything at or below
-  * its key. [[minConflicting]] is the meet over exactly those: the ancestors' own entries and the subtree's summary.
-  * Siblings do not conflict.
+  * When `A` is a [[GenBool]], so is `Trie[A]`, pointwise: at every key, the
+  * union, intersection and difference of two tries have the `or`, `and` and
+  * `without` of their values there. A key that only one trie has is combined
+  * with the zero of `A` on the other side, so intersection drops it, and
+  * difference drops it if it is the right trie's. `Trie[Boolean]` is a set of
+  * keys. The walks recurse once per level of nesting, not once per bit.
   */
-sealed trait Trie[A]:
-  /** The smallest value anywhere in the trie. It is `None` exactly when the trie is empty, which is `zero`: ask
-    * `GenBool.isZero` instead of testing for emptiness separately.
+final case class Trie[A](
+  children: TreeMap[BitVector, Trie[A]],
+  value: A
+):
+  import Trie.*
+
+  /** The value at `key`, or the zero of `A`. */
+  def get(key: Key)(using ev: GenBool[A]): A =
+    @tailrec def go(trie: Trie[A], rest: BitVector): A =
+      if rest.isEmpty then trie.value
+      else
+        trie.children
+          .rangeTo(rest)
+          .lastOption
+          .filter((l, _) => rest.startsWith(l)) match
+          case Some((l, child)) => go(child, rest.drop(l.size))
+          case None => ev.zero
+    go(this, key.bits)
+
+  /** The keys that have a value other than zero, with their values, in order: a
+    * key before the keys that extend it.
     */
-  def min: Option[A]
-
-  def insert(bits: BitVector, a: A)(using Order[A]): Trie[A] = Trie.insertFrom(this, bits, 0L, a)
-
-  /** Removes `a` from the node at `bits`. */
-  def remove(bits: BitVector, a: A)(using Order[A]): Trie[A] = Trie.removeFrom(this, bits, 0L, a)
-
-  /** The smallest value among entries whose key conflicts with `bits`. */
-  def minConflicting(bits: BitVector)(using Order[A]): Option[A] =
-    Trie.minConflictingFrom(this, bits, 0L, Trie.optionMeet[A])
-
-  /** Every entry, as a key and a value. */
-  def entries: List[(Key, A)] = Trie.entriesFrom(this, BitVector.empty)
+  def entries(using ev: GenBool[A], eq: Eq[A]): List[(Key, A)] =
+    def go(trie: Trie[A], prefix: BitVector): List[(Key, A)] =
+      Option.unless(ev.isZero(trie.value))((Key(prefix), trie.value)).toList ++
+        trie.children.toList.flatMap((l, child) => go(child, prefix ++ l))
+    go(this, BitVector.empty)
 
 object Trie:
-  private final case class Empty[A]() extends Trie[A]:
-    def min: Option[A] = None
+  def empty[A](using ev: GenBool[A]): Trie[A] = Trie(TreeMap.empty, ev.zero)
 
-  private final case class Node[A](own: SortedSet[A], zero: Trie[A], one: Trie[A], min: Option[A]) extends Trie[A]
+  /** The trie with `value` at `key` and nothing else. */
+  def single[A](key: Key, value: A)(using
+    ev: GenBool[A],
+    eq: Eq[A]
+  ): Trie[A] =
+    if ev.isZero(value) then empty
+    else if key.bits.isEmpty then Trie(TreeMap.empty, value)
+    else Trie(TreeMap(key.bits -> Trie(TreeMap.empty, value)), ev.zero)
 
-  // The empty trie holds no `A`, so one shared instance serves every `A`. Operations return it as is, which is what
-  // lets `x | 0` hand back `x` itself.
-  private val emptyTrie: Trie[Any] = Empty[Any]()
+  given eq[A]: Eq[Trie[A]] = Eq.fromUniversalEquals
 
-  def empty[A]: Trie[A] = emptyTrie.asInstanceOf[Trie[A]]
+  /** The pointwise `GenBool`, for a value type that is one. */
+  given genBool[A](using ev: GenBool[A], eq: Eq[A]): GenBool[Trie[A]] =
+    new GenBool[Trie[A]]:
+      def zero: Trie[A] = empty
+      def or(a: Trie[A], b: Trie[A]): Trie[A] =
+        combine(a, b, ev.or, keepLeft = true, keepRight = true)
+      def and(a: Trie[A], b: Trie[A]): Trie[A] =
+        combine(a, b, ev.and, keepLeft = false, keepRight = false)
+      def without(a: Trie[A], b: Trie[A]): Trie[A] =
+        combine(a, b, ev.without, keepLeft = true, keepRight = false)
 
-  def singleton[A](bits: BitVector, a: A)(using Order[A]): Trie[A] = empty[A].insert(bits, a)
-
-  /** The only way to build a node. The empty trie is exactly the one whose summary is the top of the summary lattice
-    * (`None`: nothing stored), so an all-empty node collapses to it and no other trie is ever empty.
+  /** The trie whose value at every key is `op` of the two values there. What
+    * only one side has is combined with the zero of `A` on the other, which
+    * `keepLeft` and `keepRight` say gives back that value (`op(a, zero) = a`)
+    * or zero (`op(a, zero) = zero`), for the left side and the right side
+    * respectively. That is what lets a side's own entries be kept or dropped
+    * without looking at them.
     */
-  private def node[A](own: SortedSet[A], zero: Trie[A], one: Trie[A])(using Order[A]): Trie[A] =
-    val L = optionMeet[A]
-    val summary = L.meetSemilattice.combineAll(List(own.headOption, zero.min, one.min))
-    if L.isOne(summary) then empty else Node(own, zero, one, summary)
+  def combine[A](
+    x: Trie[A],
+    y: Trie[A],
+    op: (A, A) => A,
+    keepLeft: Boolean,
+    keepRight: Boolean
+  )(using ev: GenBool[A], eq: Eq[A]): Trie[A] =
 
-  /** A trie as a node: the empty trie is a node with no values whose children are again empty. */
-  private def parts[A](t: Trie[A])(using ord: Order[A]): (SortedSet[A], Trie[A], Trie[A]) =
-    t match
-      case n: Node[A] => (n.own, n.zero, n.one)
-      case _          => (SortedSet.empty(using ord.toOrdering), t, t)
+    /** The edges that a combined child leaves. A child that holds zero is not a
+      * node: what is below it hangs from the parent instead, with longer
+      * labels, and nothing is left if there is nothing below it.
+      */
+    def edges(label: BitVector, t: Trie[A]): Vector[(BitVector, Trie[A])] =
+      if !ev.isZero(t.value) then Vector((label, t))
+      else t.children.toVector.map((l, c) => (label ++ l, c))
 
-  // `i` is the number of bits of `bits` already consumed on the way down to the trie `t`.
+    /** The children of the combination. Both lists are antichains in order, so
+      * what overlaps a label is next to it. The label that is a prefix of the
+      * others it conflicts with is where they are combined: they are all that
+      * the other side has below it, a trie of its own with nothing at the top.
+      */
+    @tailrec def go(
+      xs: List[(BitVector, Trie[A])],
+      ys: List[(BitVector, Trie[A])],
+      out: Vector[(BitVector, Trie[A])]
+    ): Vector[(BitVector, Trie[A])] =
+      def below(
+        label: BitVector,
+        side: List[(BitVector, Trie[A])]
+      ): (Trie[A], List[(BitVector, Trie[A])]) =
+        val (inside, outside) = side.span((l, _) => l.startsWith(label))
+        (
+          Trie(
+            TreeMap.from(inside.map((l, t) => (l.drop(label.size), t))),
+            ev.zero
+          ),
+          outside
+        )
+      (xs, ys) match
+        case (Nil, Nil) => out
+        case (Nil, _) => if keepRight then out ++ ys else out
+        case (_, Nil) => if keepLeft then out ++ xs else out
+        case ((lx, tx) :: xt, (ly, ty) :: yt) =>
+          if lx == ly then
+            go(
+              xt,
+              yt,
+              out ++ edges(lx, combine(tx, ty, op, keepLeft, keepRight))
+            )
+          else if ly.startsWith(lx) then
+            val (v, rest) = below(lx, ys)
+            go(
+              xt,
+              rest,
+              out ++ edges(lx, combine(tx, v, op, keepLeft, keepRight))
+            )
+          else if lx.startsWith(ly) then
+            val (v, rest) = below(ly, xs)
+            go(
+              rest,
+              yt,
+              out ++ edges(ly, combine(v, ty, op, keepLeft, keepRight))
+            )
+          else if Ordering[BitVector].gt(lx, ly) then
+            go(xt, ys, if keepLeft then out :+ (lx, tx) else out)
+          else go(xs, yt, if keepRight then out :+ (ly, ty) else out)
 
-  private def insertFrom[A](t: Trie[A], bits: BitVector, i: Long, a: A)(using Order[A]): Trie[A] =
-    val (own, zero, one) = parts(t)
-    bits.lift(i) match
-      case None        => node(own + a, zero, one)
-      case Some(false) => node(own, insertFrom(zero, bits, i + 1, a), one)
-      case Some(true)  => node(own, zero, insertFrom(one, bits, i + 1, a))
-
-  private def removeFrom[A](t: Trie[A], bits: BitVector, i: Long, a: A)(using Order[A]): Trie[A] =
-    t match
-      case n: Node[A] =>
-        bits.lift(i) match
-          case None        => node(n.own - a, n.zero, n.one)
-          case Some(false) => node(n.own, removeFrom(n.zero, bits, i + 1, a), n.one)
-          case Some(true)  => node(n.own, n.zero, removeFrom(n.one, bits, i + 1, a))
-      case _ => t
-
-  private def minConflictingFrom[A](t: Trie[A], bits: BitVector, i: Long, L: BoundedMeetSemilattice[Option[A]]): Option[A] =
-    t match
-      case n: Node[A] =>
-        bits.lift(i) match
-          case None => n.min
-          case Some(bit) =>
-            L.meet(n.own.headOption, minConflictingFrom(if bit then n.one else n.zero, bits, i + 1, L))
-      case _ => None
-
-  private def entriesFrom[A](t: Trie[A], path: BitVector): List[(Key, A)] =
-    t match
-      case n: Node[A] =>
-        n.own.toList.map(a => (Key(path), a)) ++
-          entriesFrom(n.zero, path :+ false) ++
-          entriesFrom(n.one, path :+ true)
-      case _ => Nil
-
-  /** Combines two tries node by node: `ownOp` on the values at a key, `childOp` on each pair of subtries. */
-  private def zipNodes[A](x: Trie[A], y: Trie[A])(
-      ownOp: (SortedSet[A], SortedSet[A]) => SortedSet[A],
-      childOp: (Trie[A], Trie[A]) => Trie[A]
-  )(using Order[A]): Trie[A] =
-    val (ox, zx, nx) = parts(x)
-    val (oy, zy, ny) = parts(y)
-    node(ownOp(ox, oy), childOp(zx, zy), childOp(nx, ny))
-
-  /** Union, intersection and difference of the entry sets, with the empty trie as `zero`.
-    *
-    * Each operation recurses pointwise through `zipNodes`. Its base cases are the laws of `zero`, asked of the algebra
-    * itself with `isZero`: `x | 0 = x`, `x & 0 = 0`, `x - 0 = x`, `0 - x = 0`.
-    */
-  given genBool[A](using Order[A]): GenBool[Trie[A]] with
-    // `isZero` compares with `zero`. Equality is structural and a trie has one representation, so this is cheap.
-    private given Eq[Trie[A]] = Eq.fromUniversalEquals
-
-    def zero: Trie[A] = empty[A]
-
-    def or(x: Trie[A], y: Trie[A]): Trie[A] =
-      if isZero(x) then y
-      else if isZero(y) then x
-      else zipNodes(x, y)(_ ++ _, or)
-
-    def and(x: Trie[A], y: Trie[A]): Trie[A] =
-      if isZero(x) || isZero(y) then zero
-      else zipNodes(x, y)(_ & _, and)
-
-    def without(x: Trie[A], y: Trie[A]): Trie[A] =
-      if isZero(x) then zero
-      else if isZero(y) then x
-      else zipNodes(x, y)(_ diff _, without)
-
-  /** The smaller of two optional values, with `None` as the top. For a chain this is the meet of its lattice. */
-  given optionMeet[A](using ord: Order[A]): BoundedMeetSemilattice[Option[A]] with
-    def one: Option[A] = None
-
-    def meet(x: Option[A], y: Option[A]): Option[A] =
-      (x, y) match
-        case (Some(a), Some(b)) => Some(ord.min(a, b))
-        case (None, _)          => y
-        case (_, None)          => x
+    Trie(
+      TreeMap.from(go(x.children.toList, y.children.toList, Vector.empty)),
+      op(x.value, y.value)
+    )
