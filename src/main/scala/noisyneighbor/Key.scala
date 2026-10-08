@@ -1,21 +1,38 @@
 package noisyneighbor
 
-/** A bit string, most significant bit first. The empty key is the root. */
-final case class Key(bits: Vector[Boolean]):
-  def isPrefixOf(that: Key): Boolean =
-    bits.length <= that.bits.length && that.bits.startsWith(bits)
+import scodec.bits.BitVector
 
-  /** Equal keys, or one key a prefix of the other. */
-  def conflictsWith(that: Key): Boolean =
-    isPrefixOf(that) || that.isPrefixOf(this)
+/** A bit string, most significant bit first. The empty key is the root.
+  *
+  * Two keys conflict when one is a prefix of the other, or they are equal. Length is part of a key's identity: "0" and
+  * "00" are different keys.
+  *
+  * A key has no algebraic structure of its own. The meet of two keys (their longest common prefix) is a semilattice
+  * with a bottom, but nothing here needs it, and the structure that does matter, union, intersection and difference
+  * of sets of keyed entries, lives on [[Trie]].
+  *
+  * This is an opaque type, so a `Key` is a `BitVector` at runtime with no wrapper object. The type keeps keys apart
+  * from other bit vectors.
+  */
+opaque type Key = BitVector
 
 object Key:
-  val root: Key = Key(Vector.empty)
+  def apply(bits: BitVector): Key = bits
+
+  val root: Key = BitVector.empty
+
+  extension (key: Key)
+    def bits: BitVector = key
+
+    def isPrefixOf(that: Key): Boolean = that.startsWith(key)
+
+    def conflictsWith(that: Key): Boolean = key.isPrefixOf(that) || that.isPrefixOf(key)
+
+    /** The key as a string of '0' and '1' characters. */
+    def show: String = key.toBin
 
   /** Parses a string of '0' and '1' characters, e.g. "010". */
   def parse(s: String): Either[String, Key] =
-    s.foldLeft[Either[String, Vector[Boolean]]](Right(Vector.empty)) {
-      case (acc, '0') => acc.map(_ :+ false)
-      case (acc, '1') => acc.map(_ :+ true)
-      case (_, c)     => Left(s"Not a bit: '$c'")
-    }.map(Key(_))
+    s.find(c => c != '0' && c != '1') match
+      case Some(c) => Left(s"Not a bit: '$c'")
+      case None    => Right(BitVector.fromValidBin(s))

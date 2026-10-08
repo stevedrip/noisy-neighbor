@@ -1,0 +1,13 @@
+# sbt
+.bsp/
+target/
+project/target/
+project/project/
+
+# editors
+.metals/
+.bloop/
+.vscode/
+
+# local scratch (short path for sbt unix sockets)
+.tmp/
