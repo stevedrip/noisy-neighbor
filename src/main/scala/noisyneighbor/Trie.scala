@@ -21,10 +21,12 @@ import scodec.bits.BitVector
   *
   * When `A` is a [[GenBool]], so is `Trie[A]`, pointwise: at every key, the
   * union, intersection and difference of two tries have the `or`, `and` and
-  * `without` of their values there. A key that only one trie has is combined
-  * with the zero of `A` on the other side, so intersection drops it, and
-  * difference drops it if it is the right trie's. `Trie[Boolean]` is a set of
-  * keys. The walks recurse once per level of nesting, not once per bit.
+  * `without` of their values there. The algebra of a trie is the product of the
+  * algebra of its value and the algebra of its children, which is a [[GenBool]]
+  * in its own right: [[Trie.children]]. A key that only one trie has is
+  * combined with the zero of `A` on the other side, so intersection drops it,
+  * and difference drops it if it is the right trie's. `Trie[Boolean]` is a set
+  * of keys. The walks recurse once per level of nesting, not once per bit.
   */
 final case class Trie[A](
   children: TreeMap[BitVector, Trie[A]],
@@ -32,25 +34,111 @@ final case class Trie[A](
 ):
   import Trie.*
 
-  /** The value at `key`, or the zero of `A`. */
-  def get(key: Key)(using ev: GenBool[A]): A =
-    @tailrec def go(trie: Trie[A], rest: BitVector): A =
-      if rest.isEmpty then trie.value
-      else
-        trie.children
-          .rangeTo(rest)
-          .lastOption
-          .filter((l, _) => rest.startsWith(l)) match
-          case Some((l, child)) => go(child, rest.drop(l.size))
-          case None => ev.zero
-    go(this, key.bits)
-
-  /** The keys that have a value other than zero, with their values, in order: a
-    * key before the keys that extend it.
+  /** The child whose label is a prefix of `rest`, if there is one. The labels
+    * are an antichain, so it is the greatest one at or before `rest`:
+    * everything between a label and a key that extends it extends the label
+    * too.
     */
-  def entries(using ev: GenBool[A], eq: Eq[A]): List[(Key, A)] =
-    def go(trie: Trie[A], prefix: BitVector): List[(Key, A)] =
-      Option.unless(ev.isZero(trie.value))((Key(prefix), trie.value)).toList ++
+  def child(rest: BitVector): Option[(BitVector, Trie[A])] =
+    children.rangeTo(rest).lastOption.filter((l, _) => rest.startsWith(l))
+
+  /** The deepest node whose key is a prefix of `key`: this node, if no child's
+    * label is a prefix of it, and otherwise as far down as the labels go. It
+    * comes with its own key and the bits of `key` beyond it, which are none if
+    * `key` is the key of a node. Where a key ends part-way along an edge, the
+    * node above the edge owns it, with the bits that are left.
+    */
+  def owner(key: BitVector): (Trie[A], BitVector, BitVector) =
+    @tailrec def go(
+      node: Trie[A],
+      address: BitVector,
+      rest: BitVector
+    ): (Trie[A], BitVector, BitVector) =
+      node.child(rest) match
+        case Some((label, next)) =>
+          go(next, address ++ label, rest.drop(label.size))
+        case None => (node, address, rest)
+    go(this, BitVector.empty, key)
+
+  /** Applies `f` to the node for `prefix`, given its key, and rebuilds the trie
+    * around what it returns along with whatever else it returns. There is
+    * nothing if there is no node for `prefix`, which includes a key that ends
+    * part-way along an edge. The root is the node for the empty key. Every walk
+    * down to a node is this one.
+    */
+  def along[B](prefix: BitVector)(
+    f: (Trie[A], BitVector) => (Trie[A], B)
+  ): Option[(Trie[A], B)] =
+    def descend(
+      node: Trie[A],
+      address: BitVector,
+      rest: BitVector
+    ): Option[(Trie[A], B)] =
+      if rest.isEmpty then Some(f(node, address))
+      else
+        node
+          .child(rest)
+          .flatMap: (label, next) =>
+            descend(next, address ++ label, rest.drop(label.size)).map:
+              (updated, b) =>
+                (node.copy(children = node.children.updated(label, updated)), b)
+    descend(this, BitVector.empty, prefix)
+
+  /** The trie with `f` applied to the node for `prefix`, or the trie as it is
+    * if there is no such node.
+    */
+  def modify(prefix: BitVector)(f: Trie[A] => Trie[A]): Trie[A] =
+    along(prefix)((node, _) => (f(node), ())).fold(this)((updated, _) =>
+      updated
+    )
+
+  /** Makes sure there is a node for `prefix`. If there is not, one holding
+    * `fresh` is created beneath the deepest node that owns the prefix, and the
+    * children of that node that extend `prefix` become its children. If there
+    * is, `onTarget` is applied to its value. `onPath` is applied to the value
+    * of every node on the way down from the root, the target not included, and
+    * the root is the target if the prefix is empty.
+    */
+  def upsert(prefix: BitVector, fresh: A)(
+    onPath: A => A,
+    onTarget: A => A
+  ): Trie[A] =
+    def go(node: Trie[A], rest: BitVector): Trie[A] =
+      if rest.isEmpty then node.copy(value = onTarget(node.value))
+      else
+        val path = node.copy(value = onPath(node.value))
+        node.child(rest) match
+          case Some((label, next)) =>
+            path.copy(children =
+              node.children.updated(label, go(next, rest.drop(label.size)))
+            )
+          case None =>
+            val adopted = node.children.filter((l, _) => l.startsWith(rest))
+            val below =
+              TreeMap.from(adopted.map((l, c) => (l.drop(rest.size), c)))
+            path.copy(children =
+              node.children
+                .removedAll(adopted.keys)
+                .updated(rest, Trie(below, fresh))
+            )
+    go(this, prefix)
+
+  /** The trie without the nodes, and everything below them, that `drop` says to
+    * remove, looking at each node after what is below it has been pruned. The
+    * root is never removed.
+    */
+  def prune(drop: Trie[A] => Boolean): Trie[A] =
+    copy(children = children.flatMap: (label, child) =>
+      val kept = child.prune(drop)
+      if drop(kept) then None else Some(label -> kept)
+    )
+
+  /** Every node with its key and value, whatever the value is, in order: a node
+    * before the nodes below it.
+    */
+  def nodes: List[(BitVector, A)] =
+    def go(trie: Trie[A], prefix: BitVector): List[(BitVector, A)] =
+      (prefix, trie.value) ::
         trie.children.toList.flatMap((l, child) => go(child, prefix ++ l))
     go(this, BitVector.empty)
 
@@ -58,64 +146,72 @@ object Trie:
   def empty[A](using ev: GenBool[A]): Trie[A] = Trie(TreeMap.empty, ev.zero)
 
   /** The trie with `value` at `key` and nothing else. */
-  def single[A](key: Key, value: A)(using
+  def single[A](key: BitVector, value: A)(using
     ev: GenBool[A],
     eq: Eq[A]
   ): Trie[A] =
     if ev.isZero(value) then empty
-    else if key.bits.isEmpty then Trie(TreeMap.empty, value)
-    else Trie(TreeMap(key.bits -> Trie(TreeMap.empty, value)), ev.zero)
+    else if key.isEmpty then Trie(TreeMap.empty, value)
+    else Trie(TreeMap(key -> Trie(TreeMap.empty, value)), ev.zero)
 
   given eq[A]: Eq[Trie[A]] = Eq.fromUniversalEquals
 
-  /** The pointwise `GenBool`, for a value type that is one. */
-  given genBool[A](using ev: GenBool[A], eq: Eq[A]): GenBool[Trie[A]] =
+  /** The pointwise `GenBool`, for a value type that is one: the value is
+    * combined by `A`'s algebra, and the children by their own.
+    */
+  given genBool[A](using ev: GenBool[A], eqA: Eq[A]): GenBool[Trie[A]] =
     new GenBool[Trie[A]]:
+      private lazy val kids: GenBool[TreeMap[BitVector, Trie[A]]] =
+        children(using this, ev, eqA)
       def zero: Trie[A] = empty
       def or(a: Trie[A], b: Trie[A]): Trie[A] =
-        combine(a, b, ev.or, keepLeft = true, keepRight = true)
+        Trie(kids.or(a.children, b.children), ev.or(a.value, b.value))
       def and(a: Trie[A], b: Trie[A]): Trie[A] =
-        combine(a, b, ev.and, keepLeft = false, keepRight = false)
+        Trie(kids.and(a.children, b.children), ev.and(a.value, b.value))
       def without(a: Trie[A], b: Trie[A]): Trie[A] =
-        combine(a, b, ev.without, keepLeft = true, keepRight = false)
+        Trie(
+          kids.without(a.children, b.children),
+          ev.without(a.value, b.value)
+        )
 
-  /** The trie whose value at every key is `op` of the two values there. What
-    * only one side has is combined with the zero of `A` on the other, which
-    * `keepLeft` and `keepRight` say gives back that value (`op(a, zero) = a`)
-    * or zero (`op(a, zero) = zero`), for the left side and the right side
-    * respectively. That is what lets a side's own entries be kept or dropped
-    * without looking at them.
+  /** The children of a trie, as an algebra of their own: maps from labels that
+    * are an antichain to the tries below, where the subtries are combined by
+    * `sub`. It is the algebra of the finite maps from non-empty keys to `A`
+    * that they stand for, so the empty map is its zero. Where two maps have a
+    * subtrie under the same label, or one has a label that is a prefix of
+    * labels of the other, the subtries that overlap are combined by `sub`. A
+    * subtrie that only one side has is what the operation gives for it against
+    * nothing: itself, or nothing.
     */
-  def combine[A](
-    x: Trie[A],
-    y: Trie[A],
-    op: (A, A) => A,
-    keepLeft: Boolean,
-    keepRight: Boolean
-  )(using ev: GenBool[A], eq: Eq[A]): Trie[A] =
+  given children[A](using
+    sub: GenBool[Trie[A]],
+    ev: GenBool[A],
+    eq: Eq[A]
+  ): GenBool[TreeMap[BitVector, Trie[A]]] =
+    new GenBool[TreeMap[BitVector, Trie[A]]]:
+      type Children = TreeMap[BitVector, Trie[A]]
+      type Edge = (BitVector, Trie[A])
 
-    /** The edges that a combined child leaves. A child that holds zero is not a
-      * node: what is below it hangs from the parent instead, with longer
-      * labels, and nothing is left if there is nothing below it.
-      */
-    def edges(label: BitVector, t: Trie[A]): Vector[(BitVector, Trie[A])] =
-      if !ev.isZero(t.value) then Vector((label, t))
-      else t.children.toVector.map((l, c) => (label ++ l, c))
+      def zero: Children = TreeMap.empty
+      def or(a: Children, b: Children): Children =
+        merge(a, b, sub.or, identity, identity)
+      def and(a: Children, b: Children): Children =
+        merge(a, b, sub.and, _ => sub.zero, _ => sub.zero)
+      def without(a: Children, b: Children): Children =
+        merge(a, b, sub.without, identity, _ => sub.zero)
 
-    /** The children of the combination. Both lists are antichains in order, so
-      * what overlaps a label is next to it. The label that is a prefix of the
-      * others it conflicts with is where they are combined: they are all that
-      * the other side has below it, a trie of its own with nothing at the top.
-      */
-    @tailrec def go(
-      xs: List[(BitVector, Trie[A])],
-      ys: List[(BitVector, Trie[A])],
-      out: Vector[(BitVector, Trie[A])]
-    ): Vector[(BitVector, Trie[A])] =
-      def below(
-        label: BitVector,
-        side: List[(BitVector, Trie[A])]
-      ): (Trie[A], List[(BitVector, Trie[A])]) =
+      /** The edges that a combined subtrie leaves. One that holds zero is not a
+        * node: what is below it hangs from the parent instead, with longer
+        * labels, and nothing is left if there is nothing below it.
+        */
+      def edges(label: BitVector, t: Trie[A]): Vector[Edge] =
+        if !ev.isZero(t.value) then Vector((label, t))
+        else t.children.toVector.map((l, c) => (label ++ l, c))
+
+      /** What is under `label` on one side, as a trie of its own with nothing
+        * at the top, and what is after it.
+        */
+      def below(label: BitVector, side: List[Edge]): (Trie[A], List[Edge]) =
         val (inside, outside) = side.span((l, _) => l.startsWith(label))
         (
           Trie(
@@ -124,36 +220,38 @@ object Trie:
           ),
           outside
         )
-      (xs, ys) match
-        case (Nil, Nil) => out
-        case (Nil, _) => if keepRight then out ++ ys else out
-        case (_, Nil) => if keepLeft then out ++ xs else out
-        case ((lx, tx) :: xt, (ly, ty) :: yt) =>
-          if lx == ly then
-            go(
-              xt,
-              yt,
-              out ++ edges(lx, combine(tx, ty, op, keepLeft, keepRight))
-            )
-          else if ly.startsWith(lx) then
-            val (v, rest) = below(lx, ys)
-            go(
-              xt,
-              rest,
-              out ++ edges(lx, combine(tx, v, op, keepLeft, keepRight))
-            )
-          else if lx.startsWith(ly) then
-            val (v, rest) = below(ly, xs)
-            go(
-              rest,
-              yt,
-              out ++ edges(ly, combine(v, ty, op, keepLeft, keepRight))
-            )
-          else if Ordering[BitVector].gt(lx, ly) then
-            go(xt, ys, if keepLeft then out :+ (lx, tx) else out)
-          else go(xs, yt, if keepRight then out :+ (ly, ty) else out)
 
-    Trie(
-      TreeMap.from(go(x.children.toList, y.children.toList, Vector.empty)),
-      op(x.value, y.value)
-    )
+      /** Both sides are antichains in order, so what overlaps a label is next
+        * to it. The label that is a prefix of the others it conflicts with is
+        * where they are combined.
+        */
+      def merge(
+        a: Children,
+        b: Children,
+        op: (Trie[A], Trie[A]) => Trie[A],
+        onlyLeft: Trie[A] => Trie[A],
+        onlyRight: Trie[A] => Trie[A]
+      ): Children =
+        @tailrec def go(
+          xs: List[Edge],
+          ys: List[Edge],
+          out: Vector[Edge]
+        ): Vector[Edge] =
+          (xs, ys) match
+            case (Nil, Nil) => out
+            case ((lx, tx) :: xt, Nil) =>
+              go(xt, Nil, out ++ edges(lx, onlyLeft(tx)))
+            case (Nil, (ly, ty) :: yt) =>
+              go(Nil, yt, out ++ edges(ly, onlyRight(ty)))
+            case ((lx, tx) :: xt, (ly, ty) :: yt) =>
+              if lx == ly then go(xt, yt, out ++ edges(lx, op(tx, ty)))
+              else if ly.startsWith(lx) then
+                val (v, rest) = below(lx, ys)
+                go(xt, rest, out ++ edges(lx, op(tx, v)))
+              else if lx.startsWith(ly) then
+                val (v, rest) = below(ly, xs)
+                go(rest, yt, out ++ edges(ly, op(v, ty)))
+              else if Ordering[BitVector].lt(lx, ly) then
+                go(xt, ys, out ++ edges(lx, onlyLeft(tx)))
+              else go(xs, yt, out ++ edges(ly, onlyRight(ty)))
+        TreeMap.from(go(a.toList, b.toList, Vector.empty))

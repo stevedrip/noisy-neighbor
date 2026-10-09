@@ -5,18 +5,28 @@ import scala.annotation.tailrec
 import org.scalacheck.{Gen, Prop}
 import org.scalacheck.Prop.forAll
 
-import Fixtures.{genKey, key}
-import QueueTrie.Run
+import scodec.bits.BitVector
 
-class QueueTrieSuite extends ScalaCheckSuite:
+import Fixtures.{genKey as genKeyOf, key as keyOf}
+import FifoTree.Run
+
+class FifoTreeSuite extends ScalaCheckSuite:
+  /** Keys are plain bit vectors here. */
+  def key(s: String): BitVector = keyOf(s).bits
+  val genKey: Gen[BitVector] = genKeyOf.map(_.bits)
+
+  /** Two keys conflict when one is a prefix of the other. */
+  def conflict(a: BitVector, b: BitVector): Boolean =
+    a.startsWith(b) || b.startsWith(a)
+
   override def scalaCheckTestParameters =
     super.scalaCheckTestParameters.withMinSuccessfulTests(2000)
 
-  type Tree = QueueTrie[Int]
+  type Tree = FifoTree[Int]
 
   /** An empty root with the given queues split off, in order. */
   def tree(prefixes: String*): Tree =
-    prefixes.foldLeft(QueueTrie.empty[Int])((t, p) => t.split(key(p)))
+    prefixes.foldLeft(FifoTree.empty[Int])((t, p) => t.split(key(p)))
 
   /** Enqueues `(key, value)` pairs at the root. */
   def enqueued(t: Tree, messages: (String, Int)*): Tree =
@@ -26,12 +36,12 @@ class QueueTrieSuite extends ScalaCheckSuite:
 
   /** Each batch as its queue and the values in it. */
   def shape(runs: List[Run[Int]]): List[(String, List[Int])] =
-    runs.map(r => (r.queue.show, r.items.map(_.value)))
+    runs.map(r => (r.queue.toBin, r.items.map(_.value)))
 
   def values(run: Option[Run[Int]]): Option[(Long, List[Int])] =
     run.map(r => (r.first, r.items.map(_.value)))
 
-  def prefixes(t: Tree): List[String] = t.queues().map(_.show)
+  def prefixes(t: Tree): List[String] = t.queues.map(_.toBin)
 
   /** Acknowledges the whole of the batch that `runs` gave to the queue `q`. */
   def done(t: Tree, runs: List[Run[Int]], q: String): Tree =
@@ -184,7 +194,7 @@ class QueueTrieSuite extends ScalaCheckSuite:
   test(
     "split creates the queue at once, and a message already in the parent goes to it when it is read"
   ):
-    val queued = enqueued(QueueTrie.empty[Int], "01" -> 0)
+    val queued = enqueued(FifoTree.empty[Int], "01" -> 0)
     val (t1, r1) = queued.split(key("0")).advance()
     assertEquals(prefixes(t1), List("", "0"))
     assertEquals(shape(r1), List(("0", List(0))))
@@ -195,13 +205,13 @@ class QueueTrieSuite extends ScalaCheckSuite:
     assertEquals(prefixes(tree("1", "11")), List("", "1", "11"))
     assertEquals(prefixes(tree("11", "1")), List("", "1", "11"))
     // the root has one child, and it is '1'
-    assertEquals(t.children.keys.map(b => Key(b).show).toList, List("1"))
+    assertEquals(t.children.keys.map(_.toBin).toList, List("1"))
 
   test("split is idempotent: splitting what exists changes nothing"):
     val t = tree("0", "01", "1")
     assertEquals(prefixes(t.split(key("0"))), prefixes(t))
     assertEquals(prefixes(t.split(key("01"))), prefixes(t))
-    assertEquals(prefixes(t.split(Key.root)), prefixes(t))
+    assertEquals(prefixes(t.split(BitVector.empty)), prefixes(t))
     assertEquals(prefixes(t.split(key("0")).split(key("0"))), prefixes(t))
 
   test("splitting a queue that is draining stops it draining"):
@@ -230,9 +240,9 @@ class QueueTrieSuite extends ScalaCheckSuite:
     assertEquals(shape(runs), List(("011", List(0))))
 
   test("splitting the root stops it draining"):
-    val drained = tree("0").drain(Key.root)
+    val drained = tree("0").drain(BitVector.empty)
     assertEquals(drained.enqueue(key("1"), 0), None)
-    assert(drained.split(Key.root).enqueue(key("1"), 0).isDefined)
+    assert(drained.split(BitVector.empty).enqueue(key("1"), 0).isDefined)
 
   test(
     "merge: the parent keeps the range's messages as its own, and each waits for the draining queue"
@@ -283,7 +293,7 @@ class QueueTrieSuite extends ScalaCheckSuite:
   ):
     val (t1, r1) = enqueued(tree("0"), "01" -> 0, "1" -> 1).advance()
     assertEquals(shape(r1), List(("", List(1)), ("0", List(0))))
-    val drained = t1.drain(Key.root)
+    val drained = t1.drain(BitVector.empty)
     assertEquals(drained.enqueue(key("1"), 0), None)
     val (t2, r2) = drained.advance()
     assertEquals(shape(r2), shape(r1)) // nothing new, only the batches out
@@ -303,8 +313,8 @@ class QueueTrieSuite extends ScalaCheckSuite:
     * asks again has stopped working on what it had.
     */
   enum Op:
-    case Enqueue(key: Key)
-    case Split(key: Key)
+    case Enqueue(key: BitVector)
+    case Split(key: BitVector)
     case Drain(pick: Int)
     case Ack(pick: Int, count: Int)
     case AckAll(pick: Int)
@@ -336,8 +346,8 @@ class QueueTrieSuite extends ScalaCheckSuite:
   final case class Sim(
     trie: Tree,
     clock: Int,
-    keys: Vector[Key],
-    pending: Map[Key, Vector[(Long, Int)]],
+    keys: Vector[BitVector],
+    pending: Map[BitVector, Vector[(Long, Int)]],
     started: Map[Int, Int],
     firstDelivery: Map[Int, List[Int]],
     ended: Map[Int, Int],
@@ -347,7 +357,7 @@ class QueueTrieSuite extends ScalaCheckSuite:
     def problem(s: String): Sim = copy(problems = problems :+ s)
 
   def fresh: Sim = Sim(
-    QueueTrie.empty[Int],
+    FifoTree.empty[Int],
     0,
     Vector.empty,
     Map.empty,
@@ -358,7 +368,12 @@ class QueueTrieSuite extends ScalaCheckSuite:
   )
 
   /** The consumer of `queue` asked and got `run`, of at most `size`. */
-  def deliver(sim: Sim, queue: Key, run: Option[Run[Int]], size: Int): Sim =
+  def deliver(
+    sim: Sim,
+    queue: BitVector,
+    run: Option[Run[Int]],
+    size: Int
+  ): Sim =
     val (ticked, at) = sim.tick
     run match
       case None => ticked.copy(pending = ticked.pending - queue)
@@ -394,12 +409,12 @@ class QueueTrieSuite extends ScalaCheckSuite:
         )
 
   /** The consumer of `queue` asks. */
-  def askQueue(sim: Sim, queue: Key, size: Int): Sim =
+  def askQueue(sim: Sim, queue: BitVector, size: Int): Sim =
     val (t, run) = sim.trie.takeFrom(queue, size)
     deliver(sim.copy(trie = t), queue, run, size)
 
   /** Acknowledges the first `count` messages a queue handed out. */
-  def ack(sim: Sim, queue: Key, count: Int): Sim =
+  def ack(sim: Sim, queue: BitVector, count: Int): Sim =
     val (acked, rest) = sim.pending(queue).splitAt(count)
     val (ticked, at) = sim.tick
     ticked.copy(
@@ -411,7 +426,7 @@ class QueueTrieSuite extends ScalaCheckSuite:
     )
 
   def perform(sim: Sim, op: Op): Sim =
-    val held = sim.pending.filter(_._2.nonEmpty).keys.toVector.sortBy(_.show)
+    val held = sim.pending.filter(_._2.nonEmpty).keys.toVector.sortBy(_.toBin)
     op match
       case Op.Enqueue(k) =>
         sim.trie
@@ -420,7 +435,7 @@ class QueueTrieSuite extends ScalaCheckSuite:
       case Op.Split(k) =>
         sim.copy(trie = sim.trie.split(k))
       case Op.Drain(pick) =>
-        val targets = sim.trie.queues()
+        val targets = sim.trie.queues
         sim.copy(trie = sim.trie.drain(targets(pick % targets.size)))
       case Op.Ack(pick, count) if held.nonEmpty =>
         val queue = held(pick % held.size)
@@ -429,14 +444,14 @@ class QueueTrieSuite extends ScalaCheckSuite:
         val queue = held(pick % held.size)
         ack(sim, queue, sim.pending(queue).size)
       case Op.Stale(pick) =>
-        val targets = sim.trie.queues()
+        val targets = sim.trie.queues
         sim.copy(trie = sim.trie.acknowledge(targets(pick % targets.size), -1L))
       case Op.Ask(pick, size) =>
-        val targets = sim.trie.queues()
+        val targets = sim.trie.queues
         askQueue(sim, targets(pick % targets.size), size)
       case Op.AskAny(size) =>
         // Every queue before the one that answered was asked and had nothing.
-        val before = sim.trie.queues()
+        val before = sim.trie.queues
         val (t, run) = sim.trie.take(size)
         val asked = run.fold(before)(r => before.takeWhile(_ != r.queue))
         val cleared = asked.foldLeft(sim.copy(trie = t))((s, q) =>
@@ -450,10 +465,9 @@ class QueueTrieSuite extends ScalaCheckSuite:
     * waiting.
     */
   @tailrec final def settle(sim: Sim, size: Int, budget: Int = 10000): Sim =
-    val asked = sim.trie
-      .queues()
+    val asked = sim.trie.queues
       .foldLeft(sim)((s, q) =>
-        if s.trie.queues().contains(q) then askQueue(s, q, size) else s
+        if s.trie.queues.contains(q) then askQueue(s, q, size) else s
       )
     if asked.pending.isEmpty then
       if asked.trie.isEmpty then asked
@@ -473,7 +487,7 @@ class QueueTrieSuite extends ScalaCheckSuite:
       * they conflict.
       */
     def orderProblem(a: Int, b: Int): Option[String] =
-      if !sim.keys(a).conflictsWith(sim.keys(b)) then None
+      if !conflict(sim.keys(a), sim.keys(b)) then None
       else
         sim.started.get(b).flatMap { started =>
           val delivery = sim.firstDelivery(b)
@@ -485,7 +499,7 @@ class QueueTrieSuite extends ScalaCheckSuite:
             sim.ended.get(a) match
               case Some(ended) =>
                 Option.when(started < ended)(
-                  s"$b ('${sim.keys(b).show}') started at $started before $a ('${sim.keys(a).show}') was acknowledged at $ended"
+                  s"$b ('${sim.keys(b).toBin}') started at $started before $a ('${sim.keys(a).toBin}') was acknowledged at $ended"
                 )
               case None => Some(s"$b started while $a was never acknowledged")
         }

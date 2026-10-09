@@ -18,7 +18,7 @@
 ### Design shape
 
 - Pure core, effects outside: `step(state, event) => (state, commands)`. Events: `Arrived`, `Completed`, plus split and merge. Commands: `Dispatch`, `PauseReads`, `ResumeReads`.
-- `QueueTrie[A]`: `queue` (opaque FIFO), `children: TreeMap[BitVector, QueueTrie[A]]`, `drain: Boolean`.
+- `FifoTree[A]` is `Trie[Fifo[FifoTree.Item[A]]]`, a type alias with the operations as extension methods. A node is a `Fifo`: a queue that can be read without removing, acknowledged by offset, and drained (`draining`).
 - Keep the router (which queue a message belongs to) separate from the queue itself.
 - Thin cats-effect shell around the core: reader fiber, dispatch to workers, ack channel, pause signal.
 
@@ -32,7 +32,7 @@
 
 ## Status
 
-`QueueTrie` is built (`Fifo.scala`, `QueueTrie.scala`, `FifoSuite.scala`, `QueueTrieSuite.scala`) and the project compiles with 40 tests passing. A node is a `Fifo` (add, read from the front without removing, acknowledge by offset), its children, and a `draining` flag. There is no per-queue state about what was handed out. The tree is a pure value: `enqueue` (root only), `split`, `drain`, `acknowledge`, `takeFrom`, `take`, `advance`. Choices in it, to revisit:
+`FifoTree` is built (`Fifo.scala`, `FifoTree.scala`, `Trie.scala`, and their suites) on top of `Trie`. `FifoTree[A]` is a type alias for `Trie[Fifo[FifoTree.Item[A]]]`: a node exists for every queue that exists (a queue that does not exist is a key with no node, not an empty queue), and a node is a `Fifo` (add, which a draining one refuses; read from the front without removing; acknowledge by offset; drain; resume). There is no separate node type. All the walks (`owner`, `along`, `modify`, `upsert` with adoption, `prune`) are `Trie`'s, with relative edge labels and `BitVector` keys. `FifoTree` uses none of `Trie`'s algebra. There is no per-queue state about what was handed out. The operations are extension methods: `enqueue` (root only), `split`, `drain`, `acknowledge`, `takeFrom`, `take`, `advance`. Choices in it, to revisit:
 - A queue's own message waits only for children whose prefix is related to its key (a prefix of it, or extended by it). It waits for that child's whole subtree, since it cannot see inside. A draining child counts whatever is in it.
 - A batch is a run of own messages with no forward between them, because a forward starts running in the child at once and would overtake. The first message that is a forward, is blocked, or would exceed `maxBatch` ends the batch, and stays at the front of the queue where it is looked at again next time.
 - Offsets are absolute per queue (`Fifo.start` is the offset of the front). A re-ask is recomputed from the front, so what is out comes back because it is still startable. That holds because forwarding at a queue happens only on its own consumer's ask, and children only gain messages from that forwarding. The tree has no notion of failure, no attempt count and no retry.
@@ -42,7 +42,7 @@
 
 Tests: unit tests for the README scenarios, and a property test that does random enqueues, splits, drains, asks (of one queue or any), acknowledgments (partial, full, stale and beyond what was handed out), then checks from the recorded deliveries and acknowledgments alone that every conflicting pair ran in order (the earlier message ended before the later one started, or they share a batch in order), that every message finished, and that nothing is left waiting when nothing is running. Mutation checks done, each makes a test fail: own messages never blocked, a forward in the middle of a batch, a running queue still taking messages, the draining relation, pruning a draining queue early, a split that does not adopt.
 
-Parked, to be rebuilt on `QueueTrie`: `Scheduler`, `Runner`, `Simulator`, `Harness`, `Checks` and their suites (`SchedulerSuite`, `SimulationSuite`, `RunnerSuite`). They are in git history, and were removed from the working tree so the project compiles. `Runner`'s structure still applies: one loop fiber owning state, a reader with pause gating and a per-arrival handshake, worker fibers acking. `Key` and `Scheduling` (`Message`, `Event`, `Command`, to be revised) are kept.
+Parked, to be rebuilt on `FifoTree`: `Scheduler`, `Runner`, `Simulator`, `Harness`, `Checks` and their suites (`SchedulerSuite`, `SimulationSuite`, `RunnerSuite`). They are in git history, and were removed from the working tree so the project compiles. `Runner`'s structure still applies: one loop fiber owning state, a reader with pause gating and a per-arrival handshake, worker fibers acking. `Key` and `Scheduling` (`Message`, `Event`, `Command`, to be revised) are kept.
 
 Shell choices, to revisit:
 - A handler error or timeout is the consumer's concern. A source failure fails the whole run.
