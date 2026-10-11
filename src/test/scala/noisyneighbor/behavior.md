@@ -1,26 +1,30 @@
-In the diagrams below, `key#n` is the key of the nth message enqueued, so that the two `""` messages can be told apart.
+These scenarios show how the shape of a FIFO trie decides which messages can be consumed concurrently.
+
+Two messages conflict when one key is a prefix of the other, or the keys are equal. A message must be consumed after every earlier message it conflicts with.
+
+In the diagrams, `key#n` is the key of the nth message enqueued, so the two `""` messages can be told apart.
 
 ## Minimally Concurrent
 
-A minimally concurrent fifo trie is indistinguishable from a fifo queue. All messages are consumed in the exact order they are produced.
+A minimally concurrent FIFO trie is indistinguishable from a FIFO queue. All messages are consumed in the exact order they are produced.
 
-Both the absolute and relative trie representations look identical. There is an implicit queue at the root, and the trie has no children.
+The relative and absolute representations are identical. There is an implicit queue at the root, and the root has no children.
 
 ### Trie
 
-Nodes are queues, named by their absolute prefix. Edges are labelled with the relative prefix.
+Each node is a queue, named by its absolute prefix. Each edge is labelled with the prefix relative to its parent.
 
 ```
 ""
 ```
 
-### Relative
+### Relative (labels are relative to the parent)
 
 ```
 {}
 ```
 
-### Absolute
+### Absolute (labels are full prefixes)
 
 ```
 {}
@@ -28,21 +32,21 @@ Nodes are queues, named by their absolute prefix. Edges are labelled with the re
 
 ### Scenario
 
-We use partial orders, represented by lattices, to represent ordering constraints. The partial order lattice looks quite simple in this case and matches the total order exactly.
+We describe ordering constraints with partial orders. In the diagrams, a line from one message to the one below it means the upper message must be consumed first. Messages with no path between them may be consumed in either order, or at the same time. Here the partial order is as simple as it can be: it is the total order itself.
 
-Given messages with these keys enqueued total order...
+Messages with these keys are enqueued in this order:
 ```
 ""#1 -> "0"#2 -> "00"#3 -> "01"#4 -> "10"#5 -> "11"#6 -> "1"#7 -> ""#8
 ```
 
-...messages with those keys will be consumed in the following, trivial, partial order.
+They are consumed in the same order, which is trivially a partial order:
 ```
 ""#1 -> "0"#2 -> "00"#3 -> "01"#4 -> "10"#5 -> "11"#6 -> "1"#7 -> ""#8
 ```
 
 ## Maximally Concurrent
 
-A trie that is maximally concurrent will never block when it queue messages concurrently. Because we use finite structures, a trie can only be maximally connected up to a given depth. All messages that can be consumed concurrently are.
+A maximally concurrent trie never makes a message wait for a message it does not conflict with: every message that can be consumed concurrently is. Because tries are finite, a trie can only be maximally concurrent up to a given depth.
 
 ### Trie
 
@@ -56,7 +60,7 @@ A trie that is maximally concurrent will never block when it queue messages conc
            `-- 1 --> "11"
 ```
 
-### Relative
+### Relative (labels are relative to the parent)
 
 ```
 {
@@ -71,7 +75,7 @@ A trie that is maximally concurrent will never block when it queue messages conc
 }
 ```
 
-### Absolute
+### Absolute (labels are full prefixes)
 
 ```
 {
@@ -88,14 +92,14 @@ A trie that is maximally concurrent will never block when it queue messages conc
 
 ### Scenario
 
-The partial order lattice finally looks interesting in this scenario and includes non-determinism.
+Here the partial order is no longer a chain. Messages with no path between them, such as `"0"#2` and `"10"#5`, may be consumed in either order, or at the same time.
 
-Given messages with these keys enqueued total order...
+Messages with these keys are enqueued in this order:
 ```
 ""#1 -> "0"#2 -> "00"#3 -> "01"#4 -> "10"#5 -> "11"#6 -> "1"#7 -> ""#8
 ```
 
-...messages with those keys will be consumed in the following partial order. A line is a message that must be consumed before the one below it.
+They are consumed in this partial order:
 ```
                     ""#1
                      |
@@ -114,7 +118,7 @@ Given messages with these keys enqueued total order...
 
 ## Mixed Concurrent
 
-Tries can be branched arbitrarily, as long as their children do not have conflicting prefixes. You can isolate particularly expensive tenants with long bit strings, or use smaller bit strings to spread load across multiple fifo queues.
+A trie can branch anywhere, as long as no child's prefix is a prefix of another child's. Long prefixes isolate a particularly expensive tenant in a queue of its own. Short prefixes spread load across several FIFO queues.
 
 ### Trie
 
@@ -125,18 +129,18 @@ Tries can be branched arbitrarily, as long as their children do not have conflic
            `-- 0 --> "10"
 ```
 
-### Relative
+### Relative (labels are relative to the parent)
 
 ```
 {
   "01": {},
   "1": {
-    "0": {},
+    "0": {}
   }
 }
 ```
 
-### Absolute
+### Absolute (labels are full prefixes)
 
 ```
 {
@@ -149,14 +153,14 @@ Tries can be branched arbitrarily, as long as their children do not have conflic
 
 ### Scenario
 
-The partial order lattice blocks when it is not strictly required to for correctness under lattices that are not maximally concurrent
+A trie that is not maximally concurrent can make a message wait even when waiting is not required for correctness. In the diagram below, `"11"#6` is consumed only after `"10"#5`, although their keys do not conflict.
 
-Given messages with these keys enqueued total order...
+Messages with these keys are enqueued in this order:
 ```
 ""#1 -> "0"#2 -> "00"#3 -> "01"#4 -> "10"#5 -> "11"#6 -> "1"#7 -> ""#8
 ```
 
-...messages with those keys will be consumed in the following partial order. A line is a message that must be consumed before the one below it. Orders implied by others, such as `"10"#5` before `""#8`, are not drawn.
+They are consumed in this partial order. Orders implied by others, such as `"10"#5` before `""#8`, are not drawn:
 ```
         ""#1
           |
