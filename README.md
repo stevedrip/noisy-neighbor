@@ -47,13 +47,14 @@ its front, one at a time, and either forwards or processes each one:
   added to the back of that child queue, and acknowledged in this one. The child
   owns it from then on. A queue forwards in order and never reorders.
 - **Process.** Otherwise the message is one of the queue's own. It starts only
-  once every earlier message in the child queues that conflict with it has
-  finished. It stays at the front, unacknowledged, until it finishes, so nothing
-  behind it is read. That is how it holds back later conflicting messages.
+  once every earlier message in the child queues has finished. A queue cannot
+  see inside a child, so it waits for all of it, conflicting or not. It stays at
+  the front, unacknowledged, until it finishes, so nothing behind it is read.
+  That is how it holds back later conflicting messages.
 
 A queue runs one of its own messages at a time. Concurrency comes from having
-several queues, and from forwarding into children while the parent waits only on
-the children that conflict.
+several queues. A trie that is not maximally concurrent can make a message wait
+when waiting is not required for correctness (see behavior.md).
 
 Queues are pull-based, and each queue has one consumer at a time. Only that
 consumer moves the front of its queue. When it asks for a batch of up to some
@@ -98,8 +99,10 @@ Split off the child queue '01'. Whenever the root reads a message whose key star
 
 A message with the exact bitstring '' or '0' is one of the root's own, and conflicts with the '01'
 queue. It waits for all earlier '01' messages to finish, and later messages wait
-behind it in the root. Messages like those starting with '00' or '1' do not
-conflict with '01', and may be processed concurrently to it.
+behind it in the root. So do messages like those starting with '00' or '1',
+which do not conflict with '01' but are also the root's own: the root cannot see
+inside '01', so they wait for it too. A message forwarded to another child
+queue is not affected.
 
 # Dynamic configuration
 

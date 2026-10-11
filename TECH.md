@@ -164,6 +164,6 @@ sits at the signal edges only.
 - If the stack is already Kinesis, use it for the root queue and keep the queues
   in memory. A stream per queue is possible if the queues must be durable, with
   idempotent forwarding.
-- The proof of concept does not depend on any of this. The `FifoTree` keeps the
+- The proof of concept does not depend on any of this. The `FifoTrie` keeps the
   router (which queue a message goes to) separate from the queue, so a different
   backing queue can be swapped in later.

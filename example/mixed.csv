@@ -1,0 +1,38 @@
+# The mixed concurrency trie of behavior.md, with the eight messages it
+# enqueues, produced one after the other.
+#
+# Run it from the repository root:
+#
+#   sbt "example/runMain noisyneighbor.example.InteractiveExample --labels 01,1,10 --messages example/mixed.csv"
+#
+# Arguments:
+#
+#   --labels 01,1,10   The queues of the trie, as absolute labels. The root
+#                      exists without being listed. Here that is '', '01', '1'
+#                      and '10'. Leave it out for a trie of only the root.
+#   --messages <file>  A file of messages like this one, produced first, one
+#                      after the other.
+#   --batch <n>        The most messages a queue hands out at once. Default 1.
+#
+# Each line is key,produceSeconds,consumeSeconds. The key is a string of 0 and
+# 1, and may be empty. Producing a message sleeps for the first number of
+# seconds before it is submitted, and consuming it sleeps for the second. Lines
+# starting with # are ignored.
+#
+# Messages can also be typed on stdin while it runs, in the same format, and
+# each is produced as soon as it is read. End with Ctrl-D. For example, typing
+# 01,0,3 while this runs adds a message for the '01' queue.
+#
+# Watch '01' (4 seconds) run while '10' and then '11' run on another queue:
+# '11' waits for '10', although their keys do not conflict, because the queue
+# for '1' cannot see inside '10'.
+#
+# key,produceSeconds,consumeSeconds
+,1,1
+0,1,1
+00,1,1
+01,1,4
+10,1,2
+11,1,2
+1,1,1
+,1,1

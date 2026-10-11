@@ -1,19 +1,30 @@
 # Prototype plan (working notes, not committed)
 
+## Built
+
+- `Trie` (`Trie.scala`): a finite map from bit-string keys to values, with relative edge labels, the walks (`child`, `owner`, `along`, `modify`, `upsert`, `prune`, `nodes`), and a `GenBool` and `Functor` instance. `FifoTrie` uses none of its algebra.
+- `Fifo` (`Fifo.scala`), the queue as a trait, and `MemoryFifo`, the one in memory.
+- `FifoTrie[A, F <: Fifo]` (`FifoTrie.scala`): a trie of queues, served by fibers.
+- `example/`: an interactive example on `FifoTrie`, with `example/mixed.csv` as the reference input.
+
 ## Decided
 
-- **Model.** A trie of FIFO queues. A queue owns a key prefix, and reading from it does not remove anything until the reader acknowledges: messages are added at the back, a reader reads from the front without removing them, and acknowledging removes them. Nothing else can look inside it (no search, index or count). See README ("How queues enforce it").
-- **Producers enqueue only at the root queue.** One total arrival order. A queue forwards messages to the child whose prefix the key starts with, in order, when it reads them (acknowledging each in the parent).
-- **One message at a time per queue.** A queue's own messages (key equals its prefix, or no child owns it) wait for earlier messages in the conflicting children and hold back the queue behind them. Parallelism comes from having several queues (and several workers).
-- **Split.** The child is created at once, empty. It receives messages only as the parent reads and forwards them. The parent's existing backlog is not redistributed.
-- **Merge = drain.** The child stops accepting new messages. The parent keeps the range's messages as its own, each waiting for the draining child to be empty (all of it; the parent cannot see inside). A draining queue's children drain with it. The child is removed when empty.
-- **Kinesis is the source, not the queue.** Queues are in memory. Mapping queues to shards (or chains of shards) was explored and does not fit; reasons are in README ("Kinesis"). Checkpoint = oldest unfinished root message (`resumeFrom`).
-- **Backpressure.** Pausing reads is the policy. Capacity (bound on unfinished messages) is configuration of the consumer, not a property of the trie. Pausing happens at the root, in the shell.
-- **No failure handling.** Retries, attempt limits, poison messages and dead-lettering are the consumer's decision, not ours. A batch that was handed out and not acknowledged stays at the front of its queue, holding back what is behind it, and when the consumer asks again for a batch it gets it back. The consumer acknowledges once it is done with the messages, whatever it did with them.
+- **Model.** A trie of FIFO queues. A queue owns a key prefix. Producers add messages at the root only. A queue forwards a message to the child whose prefix its key starts with, and otherwise the message is the queue's own. Two messages conflict when one key is a prefix of the other, or they are equal, and conflicting messages are handled in arrival order. Non-conflicting ones may be handled at the same time. behavior.md draws the partial order of three scenarios, and `FifoTrieSpec` and `FifoTrieSuite` check it.
+- **An own message waits while any queue below holds anything,** conflicting or not, because a queue cannot see inside a child (behavior.md's Mixed scenario needs this: `"11"#6` waits for `"10"#5`). It waits for the whole subtree. A draining child counts whatever is in it.
+- **A batch is a run of own messages with no forward in it,** because a forward starts running in the child at once and would overtake. A message to forward ends the batch.
+- **Split.** The child is created at once, empty, and adopts the children that extend its prefix. It receives messages only as its parent forwards them. Splitting what exists changes nothing, and stops any draining queue on the way down, the target included, from draining.
+- **Merge is draining.** A draining child is not forwarded to. The parent keeps the range's messages as its own, each waiting for the draining child to be empty, and the child is removed when it, and everything below it, is empty. The root can be drained: `enqueue` and `submit` then refuse, and the root stays when it is empty.
+- **`Fifo` has no offsets.** Each end is one call that answers at once and hands what crossed to the caller's own work. `take(count, f)` is asked for a count and gives a chunk, and `offer(chunk, f)` is given a chunk and gives a count, so the two cross. The consumer must consume all it is given, there is no partial consumption, and the queue removes it once `f` has finished. If `f` fails or is cancelled the messages stay and are given again. What a caller commits to wherever it reads from or writes to, usually an offset, it does after its call has finished.
+- **Either end closes the queue.** `taking` and `offering` are `Ref[IO, Boolean]`s on the trait, true to begin with, whatever the implementation. A closed end refuses: offers get 0 and takes get an empty chunk.
+- **Draining is `offering` false.** A queue whose back is closed takes nothing new and is taken from until it is empty. The trie does not forward to it, and removes it when it, and everything below it, has emptied, closing both ends as it goes. A node of the trie is the queue itself, `Trie[F]`, with no state of the trie's own.
+- **A queue does not wait and does not look after its callers.** Waiting for messages or for room, and when an end may close, are the trie's. `MemoryFifo` is a `Ref` holding a collection, so fibers on any number of threads can share it.
+- **Concurrency, not parallelism, with `IO` fibers.** `IO` is used directly, not `F[_]`. Each queue has a fiber serving it (`FifoTrie.run`). A fiber waits by suspending until something changes, and every change wakes the ones that are waiting. A mutex guards the shape of the trie only when it changes (split, drain, prune).
+- **A queue says whether it is empty.** `Fifo.isEmpty` is true when it holds nothing, a message a take is working on included, so a message that has been given out is never in no queue at all. The trie's gates (an own message waiting for the children, a draining queue being removed) read it.
+- **Forwarding is in the work given to `take`.** A message for a child waits for room in it, and a batch of own messages waits until nothing below holds anything. The queue still holds the chunk while that happens.
+- **Backpressure.** A queue has a capacity. `enqueue` refuses when the root is full, and `submit` waits for room.
+- **No failure handling.** Retries, attempt limits and dead-lettering are the consumer's decision. Work that fails leaves the messages, so a cancel in the middle of a chunk can forward a message twice, which is at-least-once.
 - **Ordering unit is the message, never the batch.**
-- **Pull model, one consumer per queue.** The consumer asks its queue for a batch of up to X messages and may get fewer, or none (`takeFrom(queue, X)`). Only a queue's own consumer moves its front: its ask forwards what is ahead of its first own message into the children, then hands out a batch of its own messages. A child sees a message only after its parent's consumer has asked, so every consumer keeps asking. A batch starts at the first message not acknowledged, so asking again gives back what is not acknowledged and may extend it; a consumer that asks again has stopped working on what it had, which is also when a message that a split gave to a child is forwarded. Consumers acknowledge by absolute offset, cumulatively and idempotently (`acknowledge(queue, through)`), as many messages as they like, and the tree trusts the offsets it is given. `take(X)` asks the queues in turn and returns the first batch; `advance(X)` asks each once, parents first. Replacing a consumer is done only once the old one is gone.
-- **A batch comes from one queue.** The consumer asks for up to X messages and may get fewer. One batch at a time per queue. The handler applies a batch in arrival order, and a batch is acknowledged as a whole. Acks are by offset (`resumeFrom`).
-- **Removed.** The conflict-index design (radix `Trie`, `AntichainTrie`, `GenBool`/gcd, `Bits`, typelevel `algebra`) is deleted. It tracked every unfinished message in a searchable set; the queue tree makes order structural, so none of it is needed. It is in the git history (the wip commits). Remove the `algebra`, `algebra-laws` and `discipline-munit` dependencies from `build.sbt` if nothing uses them after the rewrite.
+- **Removed.** The conflict-index design, then the pure, offset-based trie (`PureFifo`, the old `FifoTrie`), the actor `Scheduler`, and the fs2 `BatchQueue`. They are in git history.
 
 ### Design shape
 
@@ -53,19 +64,31 @@ Shell choices, to revisit:
 
 ## Tests
 
-Property tests with random keys, durations and arrival orders, with an independent oracle over the output trace:
-- Every conflicting pair ran in arrival order and did not overlap.
-- Non-conflicting pairs overlapped when workers were available.
-- No message started while an earlier conflicting message was unfinished.
-- A message waiting for earlier conflicting ones holds back later conflicting ones, even ones that conflict with nothing in flight (README's worked example).
-- Splits and merges at random points do not change any of the above. After a merge, the child's messages all finish before the parent's own messages for that range start.
-- Bounded buffer never exceeded; no deadlock.
-- Mutation checks: break the code, confirm a failure, restore.
+- `FifoTrieSpec`: examples of forwarding, batches, work that fails, a child with no room, split, drain and removal, and the three behavior.md scenarios with a fiber per queue and exact times.
+- `FifoTrieSuite`: random keys, trie shapes, batch sizes and durations. Every conflicting pair is handled in arrival order, every message is handled, and nothing deadlocks.
+- `MemoryFifoSpec` and `MemoryFifoSuite`: the contract of `take` and `offer`, and a property against a plain model queue.
+
+## Direction (not built)
+
+The queues become durable streams, and producers write to the deepest queue that accepts, not only at the root. This supersedes "producers add messages at the root only", and the README's "totally ordered by their arrival on the root queue".
+
+- **Routing.** A write goes to the deepest queue on its key's path that exists and accepts. A missing queue, a draining queue and the descendants of a draining queue are skipped, and the write lands in the nearest accepting ancestor.
+- **Ordering without an atomic step.** An ancestor write does two single-queue steps in a safe order: close the descendants it conflicts with, then append. A direct write that reached a descendant before the close is earlier in arrival, and the ancestor's own message waits for it as before. A write after the close is refused and re-routes upward, landing behind the append. A failure between the steps only leaves a spurious drain. Arrival order for conflicting messages is defined by when the close completes.
+- **Split.** A new child stays closed until its parent has forwarded the backlog it holds for the range, and then opens, so a direct write cannot overtake that backlog.
+- **The deep symmetry.** Each queue has two ends with one actor each. Blocking the front (an own message waiting for the children) and closing the back (a conflicting append closing the descendants) are one rule at either end. Forwarding down is promoting up. A closed back reopens once the message that closed it is done.
+- **Kinesis (hypothesis, from memory and not checked).** Active shards partition the keyspace and never nest, so not every node of the trie has an active shard. A node whose descendants are active has none, and its own messages need it to: writing one closes the descendants, which is a shard merge into the node, and reopening is a split again once the message is done. A queue is then a lineage of segments, sealed ones read first in order, then the active one. To verify: how often Kinesis allows resharding, and how long a merge or split takes to become active.
+
+## Open decisions
+
+1. How a durable `Fifo` implements `take`, `offer` and `isEmpty`: what the checkpoint is, and what "removes once `f` has finished" means for a stream.
+2. How the routing and the close-then-append above are driven: the commands for split and merge, and how they are sequenced against arrivals.
+3. Whether `FifoTrie` should be able to peek at the front of a queue (it needs no `peek` today, because the work given to `take` decides as it goes).
+4. Fairness among queues when workers are scarce. Default: arrival order.
 
 ## Deferred
 
-- Kinesis source for the root queue (reading, checkpointing by `resumeFrom`, backoff on throttling).
+- A Kinesis or other durable backend for the queues.
 - Key encoding if a hash key is ever needed (`ExplicitHashKey`, left-aligned in the 128-bit space). Only relevant if shards are revisited.
-- Scheduler failover and leader election. Replay from checkpoint on takeover.
+- Failover and leader election. Replay from a checkpoint on takeover.
 - Automatic splitting and merging.
 - Remote workers.

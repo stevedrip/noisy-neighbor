@@ -1,6 +1,7 @@
 package noisyneighbor
 
 import algebra.lattice.GenBool
+import cats.Functor
 import cats.kernel.Eq
 import scala.annotation.tailrec
 import scala.collection.immutable.TreeMap
@@ -94,12 +95,13 @@ final case class Trie[A](
 
   /** Makes sure there is a node for `prefix`. If there is not, one holding
     * `fresh` is created beneath the deepest node that owns the prefix, and the
-    * children of that node that extend `prefix` become its children. If there
-    * is, `onTarget` is applied to its value. `onPath` is applied to the value
-    * of every node on the way down from the root, the target not included, and
-    * the root is the target if the prefix is empty.
+    * children of that node that extend `prefix` become its children. `fresh` is
+    * only evaluated then. If there is, `onTarget` is applied to its value.
+    * `onPath` is applied to the value of every node on the way down from the
+    * root, the target not included, and the root is the target if the prefix is
+    * empty.
     */
-  def upsert(prefix: BitVector, fresh: A)(
+  def upsert(prefix: BitVector, fresh: => A)(
     onPath: A => A,
     onTarget: A => A
   ): Trie[A] =
@@ -155,6 +157,14 @@ object Trie:
     else Trie(TreeMap(key -> Trie(TreeMap.empty, value)), ev.zero)
 
   given eq[A]: Eq[Trie[A]] = Eq.fromUniversalEquals
+
+  /** Maps every value, and leaves the shape alone. Nothing is checked against
+    * zero, so it is only as canonical as `f` keeps it: a function that maps a
+    * value to zero leaves a node that holds zero.
+    */
+  given Functor[Trie] with
+    def map[A, B](trie: Trie[A])(f: A => B): Trie[B] =
+      Trie(trie.children.map((l, c) => l -> map(c)(f)), f(trie.value))
 
   /** The pointwise `GenBool`, for a value type that is one: the value is
     * combined by `A`'s algebra, and the children by their own.
